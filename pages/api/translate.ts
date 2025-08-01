@@ -8,8 +8,6 @@ const corsHeaders = {
 };
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  console.log('🚀 TRANSLATION API CALLED!', new Date().toISOString());
-  
   // Handle preflight OPTIONS request
   if (req.method === 'OPTIONS') {
     return res.status(200).setHeader('Access-Control-Allow-Origin', '*')
@@ -25,8 +23,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   try {
     const { text, targetLanguage = 'German', useGlossary = false } = req.body;
-
-    console.log('📝 Request params:', { text, targetLanguage, useGlossary });
 
     if (!text) {
       return res.status(400).json({ error: 'Text to translate is required' });
@@ -45,35 +41,37 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     // Try glossary first if enabled and available
     if (useGlossary && AIRTABLE_API_KEY && AIRTABLE_BASE_ID) {
-      console.log('💫 Trying glossary translation...');
       try {
         const glossaryResult = await translateWithGlossary(text, targetLanguage, AIRTABLE_API_KEY, AIRTABLE_BASE_ID);
         if (glossaryResult.hasGlossaryTerms) {
           finalTranslation = glossaryResult.translatedText;
-          console.log('✅ Using glossary result:', finalTranslation);
-        } else {
-          console.log('⚠️ No glossary matches, falling back to AI');
         }
       } catch (glossaryError) {
-        console.warn('❌ Glossary translation failed, falling back to AI:', glossaryError);
+        console.warn('Glossary translation failed, falling back to AI:', glossaryError);
       }
     }
 
-    // Fall back to AI translation if glossary didn't work
+    // Use AI translation if no glossary result or glossary failed
     if (!finalTranslation) {
-      console.log('🤖 Using AI translation...');
-      finalTranslation = await translateWithLangdock(text, targetLanguage, LANGDOCK_API_KEY);
+      finalTranslation = await translateWithAI(text, targetLanguage, LANGDOCK_API_KEY);
     }
 
     // Return the translation with CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    
     return res.status(200).json({
-      translatedText: finalTranslation,
+      success: true,
       originalText: text,
-      targetLanguage: targetLanguage
+      translatedText: finalTranslation.trim(),
+      targetLanguage 
     });
 
   } catch (error: any) {
-    console.error('Translation error:', error);
+    console.error('Translation proxy error:', error);
+    
+    res.setHeader('Access-Control-Allow-Origin', '*');
     return res.status(500).json({ 
       error: 'Translation failed', 
       details: error.message 
@@ -81,46 +79,46 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 }
 
-// AI Translation function using Langdock
-async function translateWithLangdock(text: string, targetLanguage: string, apiKey: string): Promise<string> {
-  const response = await fetch('https://api.langdock.com/v1/chat/completions', {
+// AI Translation function (existing logic)
+async function translateWithAI(text: string, targetLanguage: string, apiKey: string): Promise<string> {
+  const response = await fetch('https://api.langdock.com/openai/eu/v1/chat/completions', {
     method: 'POST',
     headers: {
+      'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
     },
     body: JSON.stringify({
-      model: 'gpt-4',
+      model: 'gpt-4o-mini',
       messages: [
         {
+          role: 'system',
+          content: `You are a professional translator. Translate the given English text to ${targetLanguage}. Return only the ${targetLanguage} translation, no explanations or additional text.`
+        },
+        {
           role: 'user',
-          content: `Translate the following English text to ${targetLanguage}: "${text}"`
+          content: `Translate this English text to ${targetLanguage}: "${text}"`
         }
       ],
-      max_tokens: 150,
-      temperature: 0.3
+      max_tokens: 1000,
+      temperature: 0.1
     })
   });
 
   if (!response.ok) {
-    throw new Error(`Langdock API error: ${response.status}`);
+    throw new Error(`AI translation failed: ${response.status}`);
   }
 
   const data = await response.json();
-  let translatedText = data.choices[0]?.message?.content?.trim() || text;
-
-  // Clean up quotes if present
-  if (translatedText.startsWith('"') && translatedText.endsWith('"')) {
-    translatedText = translatedText.slice(1, -1);
-  }
-  if (translatedText.startsWith("'") && translatedText.endsWith("'")) {
-    translatedText = translatedText.slice(1, -1);
+  const translatedText = data.choices?.[0]?.message?.content;
+  
+  if (!translatedText) {
+    throw new Error('No translation received from AI service');
   }
 
-  return translatedText.trim();
+  return translatedText;
 }
 
-// IMPROVED Glossary Translation function
+// Simple Glossary Translation function
 async function translateWithGlossary(
   text: string, 
   targetLanguage: string, 
@@ -128,151 +126,67 @@ async function translateWithGlossary(
   baseId: string
 ): Promise<{translatedText: string, hasGlossaryTerms: boolean}> {
   
-  console.log(`🔍 Starting glossary lookup for "${text}" in ${targetLanguage}`);
-  
-  // Map language names to table names (try multiple variations)
-  const tableNames: {[key: string]: string[]} = {
-    'German': ['German translations', 'German', 'DE', 'Deutsch'],
-    'Spanish': ['Spanish translations', 'Spanish', 'ES', 'Español'], 
-    'Dutch': ['Dutch translations', 'Dutch', 'NL', 'Nederlands'],
-    'Italian': ['Italian translations', 'Italian', 'IT', 'Italiano'],
-    'Polish': ['Polish translations', 'Polish', 'PL', 'Polski'],
-    'Portuguese': ['Portuguese translations', 'Portuguese', 'PT', 'Português'],
-    'Swedish': ['Swedish translations', 'Swedish', 'SV', 'Svenska'],
-    'Finnish': ['Finnish translations', 'Finnish', 'FI', 'Suomi']
+  // Map language names to table names
+  const tableNames: {[key: string]: string} = {
+    'German': 'German translations',
+    'Spanish': 'Spanish translations', 
+    'Dutch': 'Dutch translations',
+    'Italian': 'Italian translations',
+    'Polish': 'Polish translations',
+    'Portuguese': 'Portuguese translations',
+    'Swedish': 'Swedish translations',
+    'Finnish': 'Finnish translations'
   };
 
-  const possibleTableNames = tableNames[targetLanguage] || [targetLanguage];
-  
-  let glossaryData = null;
-  let usedTableName = '';
-
-  // Try different table names
-  for (const tableName of possibleTableNames) {
-    try {
-      console.log(`📋 Trying table: "${tableName}"`);
-      const airtableUrl = `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(tableName)}`;
-      
-      const response = await fetch(airtableUrl, {
-        headers: {
-          'Authorization': `Bearer ${airtableApiKey}`,
-          'Content-Type': 'application/json'
-        }
-      });
-
-      if (response.ok) {
-        glossaryData = await response.json();
-        usedTableName = tableName;
-        console.log(`✅ Found table: "${tableName}" with ${glossaryData.records?.length || 0} records`);
-        break;
-      } else {
-        console.log(`❌ Table "${tableName}" not found (${response.status})`);
-      }
-    } catch (error: any) {
-      console.log(`❌ Error accessing table "${tableName}":`, error.message);
-    }
-  }
-
-  if (!glossaryData) {
+  const tableName = tableNames[targetLanguage];
+  if (!tableName) {
     throw new Error(`No glossary table found for language: ${targetLanguage}`);
   }
 
-  const glossaryEntries = glossaryData.records || [];
-  console.log(`📚 Processing ${glossaryEntries.length} glossary entries`);
-
-  // Create translation map with flexible column names
-  const glossaryMap: {[key: string]: string} = {};
+  // Fetch glossary from Airtable
+  const airtableUrl = `https://api.airtable.com/v0/${baseId}/${encodeURIComponent(tableName)}`;
   
+  const response = await fetch(airtableUrl, {
+    headers: {
+      'Authorization': `Bearer ${airtableApiKey}`,
+      'Content-Type': 'application/json'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Airtable API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const glossaryEntries = data.records || [];
+
+  // Create translation map
+  const glossaryMap: {[key: string]: string} = {};
   for (const record of glossaryEntries) {
-    const fields = record.fields;
-    
-    // Try different column name variations for English source
-    let englishSource = '';
-    const englishColumns = ['English source', 'English', 'EN', 'Source', 'english', 'english source'];
-    for (const col of englishColumns) {
-      if (fields[col]) {
-        englishSource = fields[col];
-        break;
-      }
-    }
-    
-    // Try different column name variations for translation
-    let translation = '';
-    const translationColumns = [
-      `${targetLanguage} translation`,
-      `${targetLanguage}`,
-      targetLanguage.toLowerCase(),
-      targetLanguage.toLowerCase() + ' translation',
-      'Translation',
-      'translation'
-    ];
-    
-    for (const col of translationColumns) {
-      if (fields[col]) {
-        translation = fields[col];
-        break;
-      }
-    }
+    const englishSource = record.fields['English source'];
+    const translation = record.fields[`${targetLanguage} translation`];
     
     if (englishSource && translation) {
-      const key = englishSource.toLowerCase().trim();
-      glossaryMap[key] = translation.trim();
-      console.log(`📖 Added: "${englishSource}" → "${translation}"`);
+      glossaryMap[englishSource.toLowerCase()] = translation;
     }
   }
-  
-  console.log(`📊 Loaded ${Object.keys(glossaryMap).length} terms from table "${usedTableName}"`);
-  
-  if (Object.keys(glossaryMap).length === 0) {
-    console.log('⚠️ No valid translations found in glossary');
-    return { translatedText: text, hasGlossaryTerms: false };
-  }
 
-  // Apply glossary translations with improved matching
+  // Apply glossary translations
   let translatedText = text;
   let hasReplacements = false;
 
   // Sort by length (longer phrases first) to avoid partial replacements
   const sortedTerms = Object.keys(glossaryMap).sort((a, b) => b.length - a.length);
   
-  console.log(`🔍 Searching for matches in: "${text.toLowerCase()}"`);
-  
   for (const englishTerm of sortedTerms) {
     const translation = glossaryMap[englishTerm];
-    
-    // Multiple matching strategies
-    const textLower = translatedText.toLowerCase();
-    const termLower = englishTerm.toLowerCase();
-    
-    // Exact match (case insensitive)
-    if (textLower === termLower) {
-      console.log(`🎯 EXACT MATCH: "${englishTerm}" → "${translation}"`);
-      translatedText = translation;
-      hasReplacements = true;
-      break;
-    }
-    
-    // Word boundary match
+    // Case-insensitive replacement
     const regex = new RegExp(`\\b${englishTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi');
     if (regex.test(translatedText)) {
-      console.log(`🎯 WORD MATCH: "${englishTerm}" → "${translation}"`);
       translatedText = translatedText.replace(regex, translation);
       hasReplacements = true;
     }
-    
-    // Partial match (contains)
-    else if (textLower.includes(termLower)) {
-      console.log(`🎯 PARTIAL MATCH: "${englishTerm}" → "${translation}"`);
-      // Only replace if it's a significant portion of the text
-      if (englishTerm.length >= text.length * 0.5) {
-        translatedText = translation;
-        hasReplacements = true;
-        break;
-      }
-    }
   }
-  
-  console.log(`🏁 Final result: hasReplacements=${hasReplacements}, result="${translatedText}"`);
 
   return {
     translatedText,
